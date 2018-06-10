@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+
+import os
+import pwd
+import glob
+import itertools
+import argparse
+
+parser = argparse.ArgumentParser(description="Filter list of X11 DISPLAY variables by username.")
+parser.add_argument( "username"
+                   , help="filter by provided username"
+                   )
+parser.add_argument( "-f", "--first"
+                   , action="store_true"
+                   , help="When given, stop after first match"
+                   )
+
+def todisplay(lock):
+    return ":" + "".join(itertools.takewhile(lambda s: s.isnumeric(), lock[::-1]))[::-1]
+
+args = parser.parse_args()
+
+xs = [ (pwd.getpwuid(os.stat(lock).st_gid).pw_name,todisplay(lock)) for lock in glob.glob("/tmp/.X11-unix/X*") ]
+xs = [ (username,display) for username,display in xs if username == args.username ]
+
+if args.first and xs:
+    xs = [xs[0]]
+
+for _,lock in xs:
+    print(lock)
