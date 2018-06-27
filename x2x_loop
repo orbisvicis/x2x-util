@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+
+import os
+import os.path
+import sys
+import stat
+import time
+import platform
+import itertools
+import subprocess
+
+from inotify_simple import INotify, Event, flags
+
+
+def to_x11_display(socket):
+    return ":" + "".join(itertools.takewhile(lambda s: s.isnumeric(), socket[::-1]))[::-1]
+
+def list_and_watch(inotify, watch_descriptor, watch_directory):
+    for entry in os.listdir(watch_directory):
+        mask = 0
+        try:
+            statinfo = os.lstat(os.path.join(watch_directory, entry))
+        except OSError:
+            continue
+        if stat.S_ISDIR(statinfo.st_mode):
+            mask |= flags.ISDIR
+        event = Event(wd=watch_descriptor, mask=mask, cookie=0, name=entry)
+        yield event
+    while True:
+        yield from inotify.read()
+
+def filter_display(descriptor_to_directory, events):
+    for event in events:
+        event_flags = flags.from_mask(event.mask)
+        if flags.DELETE_SELF in event_flags:
+            return "Watch directory removed"
+        if flags.ISDIR in event_flags:
+            continue
+        try:
+            path = os.path.join(descriptor_to_directory[event.wd], event.name)
+        except KeyError:
+            return "Unknown watch descriptor"
+        try:
+            statinfo = os.lstat(path)
+        except OSError:
+            continue
+        if statinfo.st_gid != os.getgid():
+            continue
+        if not stat.S_ISSOCK(statinfo.st_mode):
+            continue
+        display = to_x11_display(event.name)
+        if not display:
+            continue
+        yield display
+
+# As called over ssh this expects SIGHUP on connection termination. If the
+# connection is terminated without SIGHUP the ssh server will close the proxy X
+# server, which will then terminate only the "x2x" subprocess. Meanwhile this
+# process will keep restarting "x2x" subprocesses which will instantly exit in
+# error... until the rate limit is hit.
+with INotify() as inotify:
+    hostname = platform.node()
+    watch_directory = "/tmp/.X11-unix"
+    watch_flags = ( flags.CREATE | flags.DELETE | flags.DELETE_SELF
+                  | flags.DONT_FOLLOW | flags.EXCL_UNLINK | flags.ONLYDIR )
+    wait_afore = 0
+    wait_after = 2
+    fail_count = 0
+    fail_start = 0
+    fail_delta = (wait_afore + wait_after) * 10
+    fail_ratio = 1 / (wait_afore + wait_after) / 2
+    while True:
+        try:
+            watch_descriptor = inotify.add_watch(watch_directory, watch_flags)
+            display = next(filter_display\
+                        ( {watch_descriptor: watch_directory}
+                        , list_and_watch(inotify, watch_descriptor, watch_directory)))
+            inotify.rm_watch(watch_descriptor)
+            # Empty the queue for the next read. Removing the watch is
+            # guaranteed to generate an event, so this won't block.
+            inotify.read()
+        except (OSError,StopIteration) as e:
+            print(f"Encountered inotify error, shutting down:\n\t{e}")
+            break
+        x2x_args = ( [ "x2x"
+                     , "-to", display
+                     ]
+                   + sys.argv[1:]
+                   + ["-label", hostname
+                     , "-title", f"x2x to {hostname}"
+                     ])
+        # If the socket has just been created it may refuse connections. Let
+        # things settle. Call `x2x` with `-wait` (which just sleeps in a
+        # 10-second loop) in case a one-second sleep isn't enough.
+        time.sleep(wait_afore)
+        x2x_start = time.monotonic()
+        try:
+            status = subprocess.run(x2x_args)
+        except OSError as e:
+            print(f"Encountered subprocess error, shutting down:\n\t{e}")
+            break
+        if status.returncode:
+            if fail_count == 0:
+                fail_start = x2x_start
+            fail_count += 1
+        else:
+            fail_count = 0
+        delta = x2x_start - fail_start
+        if (   status.returncode
+           and fail_count > 1
+           and delta > fail_delta
+           and fail_count / delta > fail_ratio
+           ):
+            ratio = fail_count / delta
+            print( f"Encountered a subprocess failure rate >= {ratio} over "
+                   f"{delta} seconds, shutting down.")
+            break
+        # The subprocess has stopped, perhaps because the display has been
+        # closed. If so, wait a while for the socket file to be removed to
+        # prevent it from being restarted with an invalid display. The
+        # subprocess may have have exited for other reasons, so depending on
+        # inotify for socket removal may lead to an infinite wait. Therefore
+        # the best we can do is simply let things settle for a second or two.
+        time.sleep(wait_after)
