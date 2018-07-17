@@ -6,7 +6,7 @@ Utilities for working with `x2x`:
 
  *  `run_on_service`
 
-    Dispatch a command when a matching zeroconf service is added. Use this to add resiliency to a network client with automatic and immediate restarts. The command is never terminated; the client is expected to exit gracefully after the matching zeroconf service is removed.
+    Repeatedly dispatch a command contingent upon the availability of a matching zeroconf service. Use this to add resiliency to a network client with automatic and immediate restarts. The command is never terminated; the client is expected to exit gracefully after the matching zeroconf service is removed.
 
  *  `x2x_loop`
 

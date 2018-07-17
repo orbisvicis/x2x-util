@@ -1,61 +1,88 @@
 #!/usr/bin/env python3
 
+import time
 import string
 import argparse
 import subprocess
+import threading
 import zeroconf
 
 
 class ListenAndSpawn:
     def __init__(self, name, command):
+        self.info_cv = threading.Condition()
+        self.info = None
         self.name = name
         self.command = command
-        self.process = None
+
+    def remove_service(self, zeroconf, type, name):
+        if name != self.name:
+            return
+        with self.info_cv:
+            self.info = None
+
+    def add_service(self, zeroconf, type, name):
+        if name != self.name:
+            return
+        info = zeroconf.get_service_info(type, name)
+        if info is None:
+            return
+        with self.info_cv:
+            self.info = info
+            self.info_cv.notify()
 
     def command_substitute(self, info):
         return [string.Template(i).safe_substitute(vars(info))
                 for i in self.command]
 
-    def remove_service(self, zeroconf, type, name):
-        pass
+    def run(self):
+        while True:
+            with self.info_cv:
+                while self.info is None:
+                    self.info_cv.wait()
+                command = self.command_substitute(self.info)
+            subprocess.run(command)
+            # Let things settle. If the remote host is shutting down, without a
+            # timeout it is likely this function will be able to reacquire and
+            # relaunch the command even before a service removal event is
+            # received.
+            time.sleep(1)
 
-    def add_service(self, zeroconf, type, name):
-        if name == self.name:
-            if self.process is None or self.process.poll() is not None:
-                info = zeroconf.get_service_info(type, name)
-                self.process = subprocess.Popen(self.command_substitute(info))
 
+def main():
+    parser = argparse.ArgumentParser\
+            ( description="Repeatedly dispatch a command contingent upon the availability of a matching zeroconf service"
+            )
+    parser.add_argument\
+            ( "type"
+            , help="zeroconf service type, i.e. '_http._tcp.local.'"
+            )
+    parser.add_argument\
+            ( "name"
+            , help="zeroconf service name"
+            )
+    parser.add_argument\
+            ( "command"
+            , nargs=argparse.REMAINDER
+            , metavar="<command>"
+            , help="""
+                 command/arguments as parsed by the shell with
+                 template-based substitution (PEP-292) based on the
+                 zeroconf ServiceInfo object attributes (type, name,
+                 address, port, weight, priority, server, properties,
+                 text).
+                 """
+            )
 
-parser = argparse.ArgumentParser\
-        ( description='Dispatch a command when a matching zeroconf service is added'
-        )
-parser.add_argument\
-        ( "type"
-        , help="zeroconf service type, i.e. '_http._tcp.local.'"
-        )
-parser.add_argument\
-        ( "name"
-        , help="zeroconf service name"
-        )
-parser.add_argument\
-        ( "command"
-        , nargs=argparse.REMAINDER
-        , metavar="<command>"
-        , help="""
-             command/arguments as parsed by the shell with
-             template-based substitution (PEP-292) based on the
-             zeroconf ServiceInfo object attributes (type, name,
-             address, port, weight, priority, server, properties,
-             text).
-             """
-        )
-
-args = parser.parse_args()
-if args.command:
+    args = parser.parse_args()
+    if not args.command:
+        parser.error("<command> must not be empty")
     zc = zeroconf.Zeroconf()
     ls = ListenAndSpawn(args.name, args.command)
     bw = zeroconf.ServiceBrowser(zc, args.type, ls)
-    bw.join()
+    ls.run()
     zc.close()
-else:
-    print("No command, exiting...")
+    bw.join()
+
+if __name__ == "__main__":
+    main()
